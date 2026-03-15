@@ -27,5 +27,7 @@ RUN mkdir -p /app/logs
 # ── Port exposé ───────────────────────────────────────────────────
 EXPOSE 8000 9001
 
-# ── Démarrage via Supervisord ─────────────────────────────────────
-CMD ["supervisord", "-c", "/app/supervisord.conf"]
+# ── Démarrage ─────────────────────────────────────
+COPY start.sh .
+RUN chmod +x start.sh
+CMD ["./start.sh"]
