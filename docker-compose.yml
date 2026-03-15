@@ -1,0 +1,69 @@
+version: "3.9"
+
+services:
+
+  # ── MongoDB ──────────────────────────────────────────────────────
+  mongo:
+    image: mongo:7
+    container_name: pharmaco_mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_DATABASE: pharmaco
+    volumes:
+      - mongo_data:/data/db
+    ports:
+      - "27017:27017"
+    networks:
+      - pharmaco_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ─────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: pharmaco_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    networks:
+      - pharmaco_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── API + Scraper Manager (supervisord) ───────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pharmaco_api
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"    # API REST
+      - "9001:9001"    # Supervisord Web UI
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - pharmaco_net
+
+volumes:
+  mongo_data:
+
+networks:
+  pharmaco_net:
+    driver: bridge
