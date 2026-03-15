@@ -25,7 +25,7 @@ COPY . .
 RUN mkdir -p /app/logs
 
 # ── Port exposé ───────────────────────────────────────────────────
-EXPOSE 8000 9001
+EXPOSE 8000
 
 # ── Démarrage ─────────────────────────────────────
 COPY start.sh .
