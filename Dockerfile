@@ -11,26 +11,21 @@ WORKDIR /app
 # libgl1 + libglib2.0-0 : requis par OpenCV (dépendance d'EasyOCR)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    libxml2-dev \
-    libxslt-dev \
+    curl \
     libgl1 \
     libglib2.0-0 \
-    curl \
+    libxml2-dev \
+    libxslt-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Dépendances Python ────────────────────────────────────────────
+# ── Dépendances Python + préchargement modèles EasyOCR ───────────
+# torch/torchvision CPU-only installés en premier (évite ~800 Mo CUDA)
+# Modèles EasyOCR baked dans l'image → aucun téléchargement au runtime
 COPY requirements.txt .
-# Installer PyTorch CPU-only en premier (évite de tirer ~800 Mo avec CUDA)
 RUN pip install --upgrade pip && \
-    pip install torch --index-url https://download.pytorch.org/whl/cpu && \
-    pip install -r requirements.txt
-
-# ── Préchargement des modèles EasyOCR ────────────────────────────
-# Baked dans l'image → aucun téléchargement au démarrage du conteneur
-RUN python -c "\
-import easyocr; \
-easyocr.Reader(['fr', 'en'], gpu=False, verbose=False, \
-               model_storage_directory='/app/.easyocr')"
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
+    pip install -r requirements.txt && \
+    python -c "import easyocr; easyocr.Reader(['fr', 'en'], gpu=False, verbose=False, model_storage_directory='/app/.easyocr')"
 
 # ── Code source ───────────────────────────────────────────────────
 COPY . .
