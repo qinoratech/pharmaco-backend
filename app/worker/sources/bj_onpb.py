@@ -245,6 +245,11 @@ class OnpbBeninScraper(BaseScraper):
             soup  = BeautifulSoup(resp.text, "lxml")
             links = soup.find_all("a", href=re.compile(r"/programme-de-garde-"))
 
+            log.debug(
+                "[BJ/onpb] page %d — %d octets reçus, %d liens trouvés | aperçu HTML : %.500s",
+                page, len(resp.text), len(links), resp.text,
+            )
+
             new = 0
             for a in links:
                 href = a.get("href", "")
