@@ -35,7 +35,6 @@ HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
@@ -244,11 +243,6 @@ class OnpbBeninScraper(BaseScraper):
 
             soup  = BeautifulSoup(resp.text, "lxml")
             links = soup.find_all("a", href=re.compile(r"/programme-de-garde-"))
-
-            log.debug(
-                "[BJ/onpb] page %d — %d octets reçus, %d liens trouvés | aperçu HTML : %.500s",
-                page, len(resp.text), len(links), resp.text,
-            )
 
             new = 0
             for a in links:
