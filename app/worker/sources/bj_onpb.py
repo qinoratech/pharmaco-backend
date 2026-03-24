@@ -2,30 +2,58 @@
 bj_onpb.py — Scraper Bénin : onpb.bj (tour de garde)
 ======================================================
 Source : https://onpb.bj/category/tour-de-garde/
-Données publiées sous forme d'images JPEG (captures WhatsApp).
 
 Pipeline :
   1. Pagination /category/tour-de-garde/page/N/
   2. Collecte des URLs d'images dans chaque article
-  3. Téléchargement + prétraitement (PIL) + OCR (EasyOCR)
-  4. Extraction regex → {name, city_name, phone, ...}
-  5. Sync MongoDB (countries → cities → pharmacies)
+  3. Téléchargement + prétraitement PIL + OCR (Tesseract)
+  4. Détection du format par département (5 formats distincts)
+  5. Extraction structurée → {name, city_name, phone, address, ...}
+  6. Sync MongoDB (countries → cities → pharmacies)
+
+Formats par département :
+  FORMAT_A  ZOU, COLLINES, MONO, COUFFO
+            colonnes : PHARMACIE | LOCALITE | TELEPHONE
+            city     : colonne VILLE/ARR
+
+  FORMAT_B  ATACORA, DONGA, BORGOU, ALIBORI
+            lignes alternées : contact_name (noir) / name (vert)
+            phone    : Téléphone pharmacie
+            city     : ligne standalone
+
+  FORMAT_C  LITTORAL
+            colonnes : NOM DE LA PHARMACIE | QUARTIER | TELEPHONE
+            city     : ligne d'en-tête horizontale
+
+  FORMAT_D  ATLANTIQUE
+            colonnes : NOM DE PHARMACIE | QUARTIER | TELEPHONE
+            city     : ligne d'en-tête horizontale
+
+  FORMAT_E  OUEME, PLATEAU
+            colonnes : PHARMACIE | QUARTIER | CONTACT
+            city     : colonne REGION
+            alt      : "NomPharmacie Tél:0000000"
 """
 
 import re
 import json
 import logging
+from enum import Enum, auto
 from io import BytesIO
 
 import httpx
-import pytesseract
 from bs4 import BeautifulSoup
 from PIL import Image, ImageEnhance, ImageFilter
+import pytesseract
 
 from app.worker.base_scraper import BaseScraper
 from app.worker.scraper_registry import register_scraper
 
 log = logging.getLogger("pharmaco.scraper.bj_onpb")
+
+# ── Constantes ────────────────────────────────────────────────────
+LISTING_URL = "https://onpb.bj/category/tour-de-garde/"
+MAX_PAGES   = 30
 
 HEADERS = {
     "User-Agent": (
@@ -33,132 +61,378 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
+    "Connection":      "keep-alive",
 }
 
-LISTING_URL = "https://onpb.bj/category/tour-de-garde/"
-MAX_PAGES   = 30  # sécurité anti-boucle infinie
+# ── Détection de format ───────────────────────────────────────────
+class Fmt(Enum):
+    A = auto()  # ZOU / COLLINES / MONO / COUFFO
+    B = auto()  # ATACORA / DONGA / BORGOU / ALIBORI
+    C = auto()  # LITTORAL
+    D = auto()  # ATLANTIQUE
+    E = auto()  # OUEME / PLATEAU
+    UNKNOWN = auto()
+
+# Mots-clés dans le slug d'URL → format
+_SLUG_TO_FMT: dict[str, Fmt] = {
+    "zou":        Fmt.A,
+    "collines":   Fmt.A,
+    "mono":       Fmt.A,
+    "couffo":     Fmt.A,
+    "atacora":    Fmt.B,
+    "donga":      Fmt.B,
+    "borgou":     Fmt.B,
+    "alibori":    Fmt.B,
+    "littoral":   Fmt.C,
+    "cotonou":    Fmt.C,
+    "atlantique": Fmt.D,
+    "oueme":      Fmt.E,
+    "plateau":    Fmt.E,
+}
+
+# En-têtes caractéristiques dans le texte OCR → format
+_HEADER_PATTERNS: list[tuple[re.Pattern, Fmt]] = [
+    (re.compile(r"LOCALITE",                    re.I), Fmt.A),
+    (re.compile(r"PHARMACIE\s+NOM",             re.I), Fmt.B),
+    (re.compile(r"NOM\s+DE\s+LA\s+PHARMACIE",  re.I), Fmt.C),
+    (re.compile(r"NOM\s+DE\s+PHARMACIE",        re.I), Fmt.D),
+    (re.compile(r"CONTACT\b",                   re.I), Fmt.E),
+]
 
 
-# ── Traitement image ───────────────────────────────────────────────────────────
+def _detect_format(region_slug: str, ocr_text: str) -> Fmt:
+    """Détermine le format à partir du slug d'URL puis du texte OCR."""
+    slug_lower = region_slug.lower()
+    for kw, fmt in _SLUG_TO_FMT.items():
+        if kw in slug_lower:
+            return fmt
 
-def _preprocess(img_bytes: bytes) -> Image.Image:
-    """Niveaux de gris + contraste amélioré + netteté → meilleur taux OCR."""
+    # Fallback : inspection des en-têtes dans le texte OCR
+    for pattern, fmt in _HEADER_PATTERNS:
+        if pattern.search(ocr_text):
+            return fmt
+
+    return Fmt.UNKNOWN
+
+
+# ── Prétraitement image + OCR ─────────────────────────────────────
+def _preprocess(img_bytes: bytes, scale: int = 2) -> Image.Image:
+    """
+    Niveaux de gris → agrandissement → contraste → netteté.
+    scale=2 double la résolution (améliore Tesseract sur petits textes).
+    """
     img = Image.open(BytesIO(img_bytes)).convert("L")
+    w, h = img.size
+    img = img.resize((w * scale, h * scale), Image.LANCZOS)
     img = ImageEnhance.Contrast(img).enhance(2.0)
+    img = ImageEnhance.Sharpness(img).enhance(2.0)
     return img.filter(ImageFilter.SHARPEN)
 
 
-def _run_ocr(img_bytes: bytes) -> str:
-    """Retourne le texte extrait d'une image via Tesseract."""
+def _ocr(img_bytes: bytes) -> str:
+    """Lance Tesseract (langue française) et retourne le texte brut."""
     img = _preprocess(img_bytes)
-    return pytesseract.image_to_string(img, lang="fra")
+    cfg = r"--oem 3 --psm 6 -l fra"
+    return pytesseract.image_to_string(img, config=cfg)
 
 
-# ── Parsing texte OCR ──────────────────────────────────────────────────────────
-
-def _clean(s: str) -> str:
+# ── Utilitaires communs ───────────────────────────────────────────
+def _clean(s: str | None) -> str:
+    if not s:
+        return ""
     return re.sub(r"\s+", " ", s.replace("\u00a0", " ")).strip()
 
+# Numéros béninois : 8 chiffres (éventuellement avec +229 ou espaces)
+_PHONE_RE = re.compile(r"(\+?229\s?)?(\d[\d\s/\-\.]{5,12}\d)")
 
-# Numéros de téléphone béninois : 8 chiffres, éventuellement précédés de +229
-_PHONE_RE = re.compile(r"(\+?2?2?9?\s?\d[\d\s\-\.]{5,11}\d)")
+def _extract_phone(text: str) -> str | None:
+    m = _PHONE_RE.search(text)
+    if not m:
+        return None
+    raw = m.group(0)
+    digits = re.sub(r"[^\d+]", "", raw)
+    return digits if len(digits) >= 8 else None
 
-# Lignes à ignorer (en-têtes, mentions légales, etc.)
-_SKIP_RE = re.compile(
-    r"programme|tour\s+de\s+garde|semaine|ordre\s+national|"
-    r"pharmaciens|b[eé]nin|publi[eé]|publish|page\s+\d|©|\bwww\b",
+def _remove_phone(text: str) -> str:
+    return _PHONE_RE.sub("", text).strip(" -|/,;")
+
+# Lignes à ignorer (en-têtes, pieds de page, mentions légales)
+_IGNORE_RE = re.compile(
+    r"programme|tour\s+de\s+garde|semaine|ordre\s+national|pharmacien|"
+    r"publi|©|www\.|page\s*\d|tel[eé]phone|contact|pharmacie\s+nom|"
+    r"nom\s+de\s+(la\s+)?pharmacie|quartier|localite|r[eé]gion|arr[oô]ndissement",
     re.I,
 )
 
+def _is_header_or_skip(line: str) -> bool:
+    return bool(_IGNORE_RE.search(line)) or len(line.strip()) < 4
 
-def _is_city_candidate(line: str) -> bool:
-    """Ligne courte sans téléphone ni mot 'pharma' → probable nom de ville."""
-    return (
-        len(line) <= 30
-        and not re.search(r"pharm", line, re.I)
-        and not _PHONE_RE.search(line)
-    )
-
-
-def _extract_pharmacy(line: str, current_city: str) -> dict | None:
-    """
-    Tente d'extraire un dict pharmacie depuis une ligne OCR.
-    Retourne None si la ligne ne correspond pas à une pharmacie.
-    """
-    if not re.search(r"pharm", line, re.I):
-        return None
-
-    phone_m   = _PHONE_RE.search(line)
-    phone     = re.sub(r"[\s\-\.]", "", phone_m.group(1)) if phone_m else None
-    name_part = _PHONE_RE.sub("", line).strip(" -|/,") if phone_m else line
-
-    parts = [p.strip() for p in re.split(r"\s*[-|,]\s*", name_part) if p.strip()]
-    name  = _clean(parts[0]) if parts else None
-
-    city = current_city
-    if len(parts) >= 2:
-        last = parts[-1].upper()
-        if not re.search(r"pharm", last, re.I):
-            city = last
-
+def _make_entry(name: str, city: str, phone: str | None,
+                address: str | None = None,
+                contact: str | None = None) -> dict | None:
+    name = _clean(name)
+    city = _clean(city).upper()
     if not name or not city:
         return None
-
+    if re.match(r"^(NOM|PHARMACIE|TELEPHONE|CONTACT|QUARTIER|LOCALITE|REGION)\s*$", name, re.I):
+        return None
     return {
         "name":         name,
-        "contact_name": None,
-        "address":      None,
+        "contact_name": _clean(contact) or None,
+        "address":      _clean(address) or None,
         "city_name":    city,
         "phone":        phone,
     }
 
 
-def _parse_ocr_text(text: str, default_city: str = "") -> list[dict]:
-    """
-    Parse le texte OCR ligne par ligne.
+# ═════════════════════════════════════════════════════════════════
+# Parsers spécialisés par format
+# ═════════════════════════════════════════════════════════════════
 
-    Heuristiques :
-      • Ligne courte sans "pharma" et sans téléphone  → probable nom de ville
-      • Ligne contenant "pharma"                      → enregistrement pharmacie
+def _parse_format_a(lines: list[str]) -> list[dict]:
     """
-    pharmacies:  list[dict] = []
-    seen:        set[tuple] = set()
-    current_city = default_city.upper()
+    FORMAT A — ZOU / COLLINES / MONO / COUFFO
+    Colonnes attendues : PHARMACIE | LOCALITE (adresse) | VILLE/ARR (city) | TELEPHONE
+    """
+    results = []
+    current_city = ""
 
-    for raw_line in text.splitlines():
-        line = _clean(raw_line)
-        if not line or len(line) < 6 or _SKIP_RE.search(line):
+    for line in lines:
+        if _is_header_or_skip(line):
+            if (len(line) <= 30
+                    and not _PHONE_RE.search(line)
+                    and not re.search(r"pharm", line, re.I)):
+                candidate = re.sub(r"[^A-Za-zÀ-ÿ\s\-]", "", line).strip().upper()
+                if len(candidate) >= 3:
+                    current_city = candidate
             continue
 
-        if _is_city_candidate(line):
-            candidate = re.sub(r"[^A-Za-zÀ-ÿ\s-]", "", line).strip().upper()
-            if len(candidate) >= 3:
+        if "|" in line:
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) >= 3:
+                name    = parts[0]
+                address = parts[1] if len(parts) >= 4 else None
+                city    = parts[-2] if len(parts) >= 4 else current_city
+                phone   = _extract_phone(parts[-1])
+                if not city:
+                    city = current_city
+                e = _make_entry(name, city, phone, address)
+                if e:
+                    results.append(e)
+                continue
+
+        if re.search(r"pharm", line, re.I):
+            phone = _extract_phone(line)
+            name  = _remove_phone(line)
+            e = _make_entry(name, current_city, phone)
+            if e:
+                results.append(e)
+
+    return results
+
+
+def _parse_format_b(lines: list[str]) -> list[dict]:
+    """
+    FORMAT B — ATACORA / DONGA / BORGOU / ALIBORI
+    Structure par bloc de 2-3 lignes :
+      ligne 1 : contact_name (texte noir)
+      ligne 2 : name         (texte vert)
+      ligne 3 : phone
+    """
+    results      = []
+    current_city = ""
+    i            = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        if _is_header_or_skip(line):
+            if (len(line) <= 35
+                    and not _PHONE_RE.search(line)
+                    and not re.search(r"pharm", line, re.I)):
+                candidate = re.sub(r"[^A-Za-zÀ-ÿ\s\-]", "", line).strip().upper()
+                if len(candidate) >= 3:
+                    current_city = candidate
+            i += 1
+            continue
+
+        has_pharm  = re.search(r"pharm", line, re.I)
+        phone_here = _extract_phone(line)
+
+        if has_pharm or phone_here:
+            candidate_name    = _remove_phone(line) if phone_here else line
+            candidate_contact = None
+            phone             = phone_here
+
+            if i + 1 < len(lines) and re.search(r"pharm", lines[i + 1], re.I):
+                candidate_contact = candidate_name
+                candidate_name    = lines[i + 1]
+                i += 1
+
+            if not phone:
+                for j in range(i + 1, min(i + 3, len(lines))):
+                    p = _extract_phone(lines[j])
+                    if p:
+                        phone = p
+                        i = j
+                        break
+
+            e = _make_entry(candidate_name, current_city, phone, contact=candidate_contact)
+            if e:
+                results.append(e)
+
+        i += 1
+
+    return results
+
+
+def _parse_format_c_d(lines: list[str], fmt: Fmt) -> list[dict]:
+    """
+    FORMAT C (LITTORAL) et FORMAT D (ATLANTIQUE)
+    Colonnes : NOM PHARMACIE | QUARTIER | TELEPHONE
+    City      : ligne d'en-tête horizontale all-caps
+    """
+    results      = []
+    current_city = ""
+
+    for line in lines:
+        if (not re.search(r"pharm", line, re.I)
+                and not _PHONE_RE.search(line)
+                and len(line.strip()) <= 40
+                and re.search(r"[A-ZÀÉÈÊ]{3,}", line)):
+            candidate = re.sub(r"[^A-Za-zÀ-ÿ\s\-]", "", line).strip().upper()
+            if len(candidate) >= 3 and not _IGNORE_RE.search(candidate):
+                current_city = candidate
+                continue
+
+        if _is_header_or_skip(line):
+            continue
+
+        if "|" in line:
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) >= 2:
+                name    = parts[0]
+                address = parts[1] if len(parts) >= 3 else None
+                phone   = _extract_phone(parts[-1]) if len(parts) >= 2 else None
+                e = _make_entry(name, current_city, phone, address)
+                if e:
+                    results.append(e)
+                continue
+
+        if re.search(r"pharm", line, re.I):
+            phone  = _extract_phone(line)
+            name   = _remove_phone(line)
+            parts  = re.split(r"\s{2,}", name)
+            address = _clean(parts[-1]) if len(parts) > 1 else None
+            name   = parts[0]
+            e = _make_entry(name, current_city, phone, address)
+            if e:
+                results.append(e)
+
+    return results
+
+
+def _parse_format_e(lines: list[str]) -> list[dict]:
+    """
+    FORMAT E — OUEME / PLATEAU
+    Colonnes : PHARMACIE | QUARTIER | CONTACT
+    City      : colonne REGION (ligne standalone all-caps)
+    Alt       : "Nom Pharmacie Tél:0101010101"
+    """
+    results      = []
+    current_city = ""
+
+    for line in lines:
+        if _is_header_or_skip(line):
+            if (len(line) <= 35
+                    and not _PHONE_RE.search(line)
+                    and not re.search(r"pharm|tél|tel\b", line, re.I)):
+                candidate = re.sub(r"[^A-Za-zÀ-ÿ\s\-]", "", line).strip().upper()
+                if len(candidate) >= 3:
+                    current_city = candidate
+            continue
+
+        tél_match = re.search(r"[Tt][eé]l\s*[:\.]?\s*(\d[\d\s/\-\.]{5,12}\d)", line)
+        if tél_match:
+            phone = re.sub(r"[^\d]", "", tél_match.group(1))
+            name  = re.sub(r"\s*[Tt][eé]l\s*[:\.]?\s*\d[\d\s/\-\.]*\d", "", line).strip()
+            e = _make_entry(name, current_city, phone if len(phone) >= 8 else None)
+            if e:
+                results.append(e)
+            continue
+
+        if "|" in line:
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) >= 2:
+                name    = parts[0]
+                city    = parts[1] if len(parts) >= 3 and not re.search(r"\d{6,}", parts[1]) else current_city
+                phone   = _extract_phone(parts[-1])
+                address = parts[1] if city == current_city and len(parts) >= 3 else None
+                e = _make_entry(name, city or current_city, phone, address)
+                if e:
+                    results.append(e)
+                continue
+
+        if re.search(r"pharm", line, re.I):
+            phone = _extract_phone(line)
+            name  = _remove_phone(line)
+            e = _make_entry(name, current_city, phone)
+            if e:
+                results.append(e)
+
+    return results
+
+
+def _parse_unknown(lines: list[str]) -> list[dict]:
+    """Fallback générique : extrait toute ligne contenant 'pharm'."""
+    results      = []
+    current_city = ""
+
+    for line in lines:
+        if (not re.search(r"pharm", line, re.I)
+                and len(line) <= 30
+                and not _PHONE_RE.search(line)):
+            candidate = re.sub(r"[^A-Za-zÀ-ÿ\s\-]", "", line).strip().upper()
+            if len(candidate) >= 3 and not _IGNORE_RE.search(candidate):
                 current_city = candidate
             continue
 
-        pharmacy = _extract_pharmacy(line, current_city)
-        if pharmacy is None:
-            continue
+        if re.search(r"pharm", line, re.I):
+            phone = _extract_phone(line)
+            name  = _remove_phone(line)
+            e = _make_entry(name, current_city, phone)
+            if e:
+                results.append(e)
 
-        key = (pharmacy["name"].lower(), pharmacy["city_name"])
-        if key not in seen:
-            seen.add(key)
-            pharmacies.append(pharmacy)
-
-    return pharmacies
+    return results
 
 
-# ── Scraper ────────────────────────────────────────────────────────────────────
+def _dispatch(fmt: Fmt, ocr_text: str) -> list[dict]:
+    """Choisit le parser selon le format détecté et retourne les entrées."""
+    lines = [_clean(l) for l in ocr_text.splitlines() if _clean(l)]
+
+    if fmt == Fmt.A:
+        return _parse_format_a(lines)
+    if fmt == Fmt.B:
+        return _parse_format_b(lines)
+    if fmt in (Fmt.C, Fmt.D):
+        return _parse_format_c_d(lines, fmt)
+    if fmt == Fmt.E:
+        return _parse_format_e(lines)
+    return _parse_unknown(lines)
+
+
+# ═════════════════════════════════════════════════════════════════
+# Scraper principal
+# ═════════════════════════════════════════════════════════════════
 
 @register_scraper
 class OnpbBeninScraper(BaseScraper):
     """
     Scraper Bénin — source ONPB (onpb.bj).
-    Remplace UbpharBeninScraper (bj_ubphar.py, désactivé).
+    Remplace UbpharBeninScraper.
     """
 
     country_code = "BJ"
@@ -166,14 +440,11 @@ class OnpbBeninScraper(BaseScraper):
     source_url   = LISTING_URL
     source_name  = "onpb"
 
-    # ── fetch ─────────────────────────────────────────────────────────────────
-
+    # ── fetch ──────────────────────────────────────────────────────
     async def fetch(self) -> str:
         """
-        Pagine /category/tour-de-garde/ et collecte les URLs des images
-        contenues dans chaque article de garde.
-
-        Retourne : JSON  [{"img_url": "...", "region": "..."}, ...]
+        Pagine la catégorie et collecte les URLs d'images avec leurs métadonnées.
+        Retourne un JSON :  [{"img_url": "...", "region": "...", "fmt_hint": "A"}, ...]
         """
         image_refs: list[dict] = []
 
@@ -181,34 +452,38 @@ class OnpbBeninScraper(BaseScraper):
             headers=HEADERS, follow_redirects=True, timeout=30
         ) as client:
             articles = await self._collect_articles(client)
-            log.info("[BJ/onpb] %d articles collectés", len(articles))
+            log.info("[BJ/onpb] %d articles trouvés", len(articles))
 
-            for art_url, region in articles:
+            for art_url, region, fmt in articles:
                 try:
                     resp = await client.get(art_url)
                     resp.raise_for_status()
                     soup    = BeautifulSoup(resp.text, "lxml")
                     content = soup.find(
-                        "div", class_=re.compile(r"entry-content|post-content")
+                        "div",
+                        class_=re.compile(r"entry-content|post-content|article-content"),
                     )
                     if not content:
                         continue
                     for img in content.find_all("img"):
-                        src = img.get("src", "").strip()
-                        if src:
-                            image_refs.append({"img_url": src, "region": region})
+                        src = (img.get("data-src") or img.get("src") or "").strip()
+                        if src and re.search(r"\.(jpe?g|png|webp)", src, re.I):
+                            image_refs.append({
+                                "img_url":  src,
+                                "region":   region,
+                                "fmt_hint": fmt.name,
+                            })
                 except Exception as exc:
                     log.warning("[BJ/onpb] article ignoré (%s) : %s", art_url, exc)
 
-        log.info("[BJ/onpb] %d images à traiter via OCR", len(image_refs))
+        log.info("[BJ/onpb] %d images à traiter", len(image_refs))
         return json.dumps(image_refs)
 
     async def _collect_articles(
         self, client: httpx.AsyncClient
-    ) -> list[tuple[str, str]]:
-        """Retourne [(url_article, region), ...] en paginant la catégorie."""
-        articles: list[tuple[str, str]] = []
-        seen:     set[str]              = set()
+    ) -> list[tuple[str, str, Fmt]]:
+        articles: list[tuple[str, str, Fmt]] = []
+        seen: set[str] = set()
 
         for page in range(1, MAX_PAGES + 1):
             url = LISTING_URL if page == 1 else f"{LISTING_URL}page/{page}/"
@@ -222,40 +497,50 @@ class OnpbBeninScraper(BaseScraper):
                 break
 
             soup  = BeautifulSoup(resp.text, "lxml")
-            links = soup.find_all("a", href=re.compile(r"/programme-de-garde-"))
+            links = soup.find_all("a", href=re.compile(r"/programme-de-garde-|/tour-de-garde-"))
 
             new = 0
             for a in links:
-                href = a.get("href", "")
+                href = (a.get("href") or "").strip()
                 if href and href not in seen:
                     seen.add(href)
-                    articles.append((href, self._region_from_url(href)))
+                    region = self._region_from_url(href)
+                    fmt    = _detect_format(region, "")
+                    articles.append((href, region, fmt))
                     new += 1
 
             if new == 0:
-                break  # plus de nouveaux liens → fin de pagination
+                break
 
         return articles
 
     @staticmethod
     def _region_from_url(url: str) -> str:
-        """Extrait la région depuis le slug d'URL."""
-        m = re.search(r"/programme-de-garde-(.+?)-du-", url)
-        return m.group(1).replace("-", " ").upper() if m else ""
+        """Extrait le département/région depuis le slug."""
+        patterns = [
+            r"/programme-de-garde-(.+?)-(?:du|semaine|de)-",
+            r"/tour-de-garde-(.+?)-",
+        ]
+        for pat in patterns:
+            m = re.search(pat, url)
+            if m:
+                return m.group(1).replace("-", " ").upper()
+        return ""
 
-    # ── parse ─────────────────────────────────────────────────────────────────
-
+    # ── parse ──────────────────────────────────────────────────────
     def parse(self, raw: str) -> list[dict]:
         """
-        Pour chaque image référencée dans le JSON :
-          1. Téléchargement (httpx sync)
-          2. Prétraitement PIL
-          3. OCR EasyOCR
-          4. Extraction regex → dict pharmacie
+        Pour chaque image :
+          1. Téléchargement
+          2. OCR Tesseract
+          3. Détection du format (slug + inspection des en-têtes OCR)
+          4. Parser spécialisé
+          5. Déduplication globale
         """
-        image_refs: list[dict]   = json.loads(raw)
+        image_refs: list[dict]     = json.loads(raw)
         all_pharmacies: list[dict] = []
-        global_seen: set[tuple]   = set()
+        global_seen: set[tuple]    = set()
+        fmt_stats: dict[str, int]  = {}
 
         with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=30) as client:
             for i, item in enumerate(image_refs, start=1):
@@ -263,20 +548,28 @@ class OnpbBeninScraper(BaseScraper):
                     resp = client.get(item["img_url"])
                     resp.raise_for_status()
 
-                    text = _run_ocr(resp.content)
+                    text = _ocr(resp.content)
+                    fmt  = _detect_format(item["region"], text)
+                    fmt_stats[fmt.name] = fmt_stats.get(fmt.name, 0) + 1
+
                     log.debug(
-                        "[BJ/onpb] Image %d/%d — région=%s\n%s",
-                        i, len(image_refs), item["region"], text,
+                        "[BJ/onpb] Image %d/%d region=%s fmt=%s",
+                        i, len(image_refs), item["region"], fmt.name,
                     )
 
-                    for p in _parse_ocr_text(text, default_city=item["region"]):
+                    for p in _dispatch(fmt, text):
                         key = (p["name"].lower(), p["city_name"])
                         if key not in global_seen:
                             global_seen.add(key)
                             all_pharmacies.append(p)
 
                 except Exception as exc:
-                    log.warning("[BJ/onpb] image %d ignorée : %s", i, exc)
+                    log.warning("[BJ/onpb] image %d/%d ignorée : %s",
+                                i, len(image_refs), exc)
 
-        log.info("[BJ/onpb] %d pharmacies uniques extraites (OCR)", len(all_pharmacies))
+        log.info(
+            "[BJ/onpb] Terminé — %d pharmacies uniques | formats: %s",
+            len(all_pharmacies),
+            ", ".join(f"{k}:{v}" for k, v in sorted(fmt_stats.items())),
+        )
         return all_pharmacies
