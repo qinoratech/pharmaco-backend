@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 h
 
     # Scraper
-    UBPHAR_URL: str = "https://www.ubphar.com/content/ubphar/liste-des-pharmacies"
+    ONPB_URL: str = "https://onpb.bj/category/tour-de-garde/"
     SCRAPER_INTERVAL_HOURS: int = 24
 
     class Config:

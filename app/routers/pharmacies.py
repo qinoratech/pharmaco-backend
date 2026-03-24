@@ -2,7 +2,6 @@ import re
 from fastapi import APIRouter, HTTPException, Query, status, Depends
 from bson import ObjectId
 from bson.errors import InvalidId
-from datetime import date
 
 from app.database import get_db
 from app.schemas.pharmacy import PharmacyCreate, PharmacyUpdate, PharmacyOut
@@ -16,13 +15,6 @@ async def _enrich(doc: dict, db) -> PharmacyOut:
     city_name = city_doc["name"] if city_doc else None
     country_code = city_doc.get("country_code") if city_doc else None
     country_name = city_doc.get("country_name") if city_doc else None
-
-    today = date.today().isoformat()
-    duty = await db.duty_schedules.find_one({
-        "pharmacy_id": doc["_id"],
-        "date": today,
-        "validated": True,
-    })
 
     loc = doc.get("location", {}) or {}
     coords = loc.get("coordinates", [None, None])
@@ -39,7 +31,7 @@ async def _enrich(doc: dict, db) -> PharmacyOut:
         latitude=coords[1],
         longitude=coords[0],
         is_active=doc.get("is_active", True),
-        is_on_duty_today=duty is not None,
+        is_on_duty_today=doc.get("is_active", True),
     )
 
 
@@ -106,16 +98,6 @@ async def list_pharmacies(
                 search_conditions.append({"city_id": {"$in": city_ids_partial}})
             query["$or"] = search_conditions
 
-    if on_duty_today:
-        today = date.today().isoformat()
-        duty_ids = await db.duty_schedules.distinct(
-            "pharmacy_id", {"date": today, "validated": True}
-        )
-        if "_id" in query:
-            query["_id"]["$in"] = list(set(query["_id"]["$in"]) & set(duty_ids))
-        else:
-            query["_id"] = {"$in": duty_ids}
-
     docs = await db.pharmacies.find(query).skip(skip).limit(limit).to_list(length=limit)
     return [await _enrich(d, db) for d in docs]
 
@@ -168,16 +150,6 @@ async def pharmacies_on_duty_today(
                 search_conditions.append({"city_id": {"$in": city_ids_partial}})
             query["$or"] = search_conditions
 
-    if on_duty_today:
-        today = date.today().isoformat()
-        duty_ids = await db.duty_schedules.distinct(
-            "pharmacy_id", {"date": today, "validated": True}
-        )
-        if "_id" in query:
-            query["_id"]["$in"] = list(set(query["_id"]["$in"]) & set(duty_ids))
-        else:
-            query["_id"] = {"$in": duty_ids}
-
     docs = await db.pharmacies.find(query).skip(skip).limit(limit).to_list(length=limit)
     return [await _enrich(d, db) for d in docs]
 
@@ -203,13 +175,6 @@ async def pharmacies_nearby(
     if country_code:
         city_ids = await db.cities.distinct("_id", {"country_code": country_code.upper()})
         query["city_id"] = {"$in": city_ids}
-
-    if on_duty_today:
-        today = date.today().isoformat()
-        duty_ids = await db.duty_schedules.distinct(
-            "pharmacy_id", {"date": today, "validated": True}
-        )
-        query["_id"] = {"$in": duty_ids}
 
     docs = await db.pharmacies.find(query).limit(20).to_list(length=20)
     return [await _enrich(d, db) for d in docs]
