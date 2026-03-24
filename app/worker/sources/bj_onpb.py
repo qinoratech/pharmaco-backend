@@ -12,13 +12,13 @@ Pipeline :
   5. Sync MongoDB (countries → cities → pharmacies)
 """
 
-import os
 import re
 import json
 import logging
 from io import BytesIO
 
 import httpx
+import pytesseract
 from bs4 import BeautifulSoup
 from PIL import Image, ImageEnhance, ImageFilter
 
@@ -42,40 +42,20 @@ HEADERS = {
 LISTING_URL = "https://onpb.bj/category/tour-de-garde/"
 MAX_PAGES   = 30  # sécurité anti-boucle infinie
 
-# ── OCR reader (chargé une seule fois au premier appel) ────────────────────────
-_ocr_reader = None
-
-
-def _get_reader():
-    global _ocr_reader
-    if _ocr_reader is None:
-        import easyocr  # import tardif : lourd à charger
-        model_dir = os.environ.get("EASYOCR_MODULE_PATH", os.path.expanduser("~/.EasyOCR"))
-        log.info("[BJ/onpb] Initialisation EasyOCR (modèles : %s)…", model_dir)
-        _ocr_reader = easyocr.Reader(
-            ["fr", "en"], gpu=False, verbose=False,
-            model_storage_directory=model_dir,
-        )
-    return _ocr_reader
-
 
 # ── Traitement image ───────────────────────────────────────────────────────────
 
-def _preprocess(img_bytes: bytes) -> bytes:
+def _preprocess(img_bytes: bytes) -> Image.Image:
     """Niveaux de gris + contraste amélioré + netteté → meilleur taux OCR."""
     img = Image.open(BytesIO(img_bytes)).convert("L")
     img = ImageEnhance.Contrast(img).enhance(2.0)
-    img = img.filter(ImageFilter.SHARPEN)
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    return img.filter(ImageFilter.SHARPEN)
 
 
 def _run_ocr(img_bytes: bytes) -> str:
-    """Retourne le texte extrait d'une image."""
-    processed = _preprocess(img_bytes)
-    results   = _get_reader().readtext(processed, detail=0, paragraph=True)
-    return "\n".join(results)
+    """Retourne le texte extrait d'une image via Tesseract."""
+    img = _preprocess(img_bytes)
+    return pytesseract.image_to_string(img, lang="fra")
 
 
 # ── Parsing texte OCR ──────────────────────────────────────────────────────────
