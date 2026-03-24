@@ -37,6 +37,7 @@ Formats par département :
 
 import re
 import json
+import time
 import logging
 from enum import Enum, auto
 from io import BytesIO
@@ -515,6 +516,34 @@ class OnpbBeninScraper(BaseScraper):
         return articles
 
     @staticmethod
+    def _fetch_with_retry(url: str, max_attempts: int = 3) -> bytes | None:
+        """
+        Télécharge une image avec retry + backoff exponentiel.
+        Recrée un nouveau client à chaque tentative pour éviter
+        les connexions mortes après un Server disconnect.
+        """
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with httpx.Client(
+                    headers=HEADERS, follow_redirects=True, timeout=30
+                ) as client:
+                    resp = client.get(url)
+                    resp.raise_for_status()
+                    return resp.content
+            except Exception as exc:
+                wait = 2 ** attempt  # 2s, 4s, 8s
+                if attempt < max_attempts:
+                    log.warning(
+                        "[BJ/onpb] %s — tentative %d/%d, retry dans %ds : %s",
+                        url.split("/")[-1], attempt, max_attempts, wait, exc,
+                    )
+                    time.sleep(wait)
+                else:
+                    log.warning("[BJ/onpb] image ignorée après %d tentatives : %s",
+                                max_attempts, exc)
+        return None
+
+    @staticmethod
     def _region_from_url(url: str) -> str:
         """Extrait le département/région depuis le slug."""
         patterns = [
@@ -542,30 +571,32 @@ class OnpbBeninScraper(BaseScraper):
         global_seen: set[tuple]    = set()
         fmt_stats: dict[str, int]  = {}
 
-        with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=30) as client:
-            for i, item in enumerate(image_refs, start=1):
-                try:
-                    resp = client.get(item["img_url"])
-                    resp.raise_for_status()
+        for i, item in enumerate(image_refs, start=1):
+            img_bytes = self._fetch_with_retry(item["img_url"])
+            if img_bytes is None:
+                continue
 
-                    text = _ocr(resp.content)
-                    fmt  = _detect_format(item["region"], text)
-                    fmt_stats[fmt.name] = fmt_stats.get(fmt.name, 0) + 1
+            try:
+                text = _ocr(img_bytes)
+                fmt  = _detect_format(item["region"], text)
+                fmt_stats[fmt.name] = fmt_stats.get(fmt.name, 0) + 1
 
-                    log.debug(
-                        "[BJ/onpb] Image %d/%d region=%s fmt=%s",
-                        i, len(image_refs), item["region"], fmt.name,
-                    )
+                log.debug(
+                    "[BJ/onpb] Image %d/%d region=%s fmt=%s",
+                    i, len(image_refs), item["region"], fmt.name,
+                )
 
-                    for p in _dispatch(fmt, text):
-                        key = (p["name"].lower(), p["city_name"])
-                        if key not in global_seen:
-                            global_seen.add(key)
-                            all_pharmacies.append(p)
+                for p in _dispatch(fmt, text):
+                    key = (p["name"].lower(), p["city_name"])
+                    if key not in global_seen:
+                        global_seen.add(key)
+                        all_pharmacies.append(p)
 
-                except Exception as exc:
-                    log.warning("[BJ/onpb] image %d/%d ignorée : %s",
-                                i, len(image_refs), exc)
+            except Exception as exc:
+                log.warning("[BJ/onpb] OCR image %d/%d échouée : %s",
+                            i, len(image_refs), exc)
+
+            time.sleep(0.8)  # délai entre images pour éviter le rate limiting
 
         log.info(
             "[BJ/onpb] Terminé — %d pharmacies uniques | formats: %s",
