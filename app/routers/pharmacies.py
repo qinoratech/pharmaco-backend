@@ -31,7 +31,7 @@ async def _enrich(doc: dict, db) -> PharmacyOut:
         latitude=coords[1],
         longitude=coords[0],
         is_active=doc.get("is_active", True),
-        is_on_duty_today=doc.get("is_active", True),
+        is_on_duty_today=doc.get("is_on_duty_today", False),
     )
 
 
@@ -63,6 +63,8 @@ async def list_pharmacies(
     query: dict = {}
     if active_only:
         query["is_active"] = True
+    if on_duty_today:
+        query["is_on_duty_today"] = True
 
     if city_id:
         try:
@@ -114,7 +116,8 @@ async def pharmacies_on_duty_today(
     limit: int = Query(50, ge=1, le=200),
 ):
     db = get_db()
-    query: dict = {}
+    # Endpoint dédié : on ne renvoie QUE les pharmacies de garde du jour.
+    query: dict = {"is_on_duty_today": True}
     if active_only:
         query["is_active"] = True
 
@@ -172,6 +175,8 @@ async def pharmacies_nearby(
             }
         },
     }
+    if on_duty_today:
+        query["is_on_duty_today"] = True
     if country_code:
         city_ids = await db.cities.distinct("_id", {"country_code": country_code.upper()})
         query["city_id"] = {"$in": city_ids}

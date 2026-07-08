@@ -34,7 +34,9 @@ async def global_stats():
     # Comptages parallèles
     total_pharmacies   = await db.pharmacies.count_documents({"is_active": True})
     total_cities       = await db.cities.count_documents({})
-    duties_today       = await db.pharmacies.count_documents({"is_active": True})
+    duties_today       = await db.pharmacies.count_documents(
+        {"is_active": True, "is_on_duty_today": True}
+    )
     duties_this_month  = await db.duty_schedules.count_documents({
         "date": {"$gte": month_start},
         "validated": True,

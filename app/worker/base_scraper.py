@@ -112,23 +112,34 @@ class BaseScraper(ABC):
         upserted = updated = 0
         for p in pharmacies:
             city_oid = city_cache[p["city_name"]]
+
+            set_fields: dict[str, Any] = {
+                "contact_name":     p.get("contact_name"),
+                "address":          p.get("address"),
+                "phone":            p.get("phone"),
+                "is_active":        True,
+                # Statut de garde réel fourni par la source (défaut : False)
+                "is_on_duty_today": bool(p.get("en_garde", False)),
+                "source":           self.source_name,
+                "last_scraped_at":  scraped_at,
+            }
+            set_on_insert: dict[str, Any] = {
+                "name":    p["name"],
+                "city_id": city_oid,
+            }
+
+            # Coordonnées GPS (GeoJSON Point [lng, lat]) si la source les fournit.
+            # Si absentes, on ne les met qu'à l'insertion pour ne pas écraser
+            # d'éventuelles coordonnées déjà connues.
+            lat, lng = p.get("latitude"), p.get("longitude")
+            if lat is not None and lng is not None:
+                set_fields["location"] = {"type": "Point", "coordinates": [lng, lat]}
+            else:
+                set_on_insert["location"] = None
+
             result = await db.pharmacies.update_one(
                 {"name": p["name"], "city_id": city_oid},
-                {
-                    "$set": {
-                        "contact_name":    p.get("contact_name"),
-                        "address":         p.get("address"),
-                        "phone":           p.get("phone"),
-                        "is_active":       True,
-                        "source":          self.source_name,
-                        "last_scraped_at": scraped_at,
-                    },
-                    "$setOnInsert": {
-                        "name":     p["name"],
-                        "city_id":  city_oid,
-                        "location": None,
-                    },
-                },
+                {"$set": set_fields, "$setOnInsert": set_on_insert},
                 upsert=True,
             )
             if result.upserted_id:
@@ -136,7 +147,34 @@ class BaseScraper(ABC):
             elif result.modified_count:
                 updated += 1
 
-        return {"cities": len(city_cache), "upserted": upserted, "updated": updated}
+        # -- 4. Balayage (mark-and-sweep) -----------------------------
+        # Miroir de la source : toute pharmacie issue du scraping qui n'a
+        # PAS été revue lors de ce run (last_scraped_at != scraped_at) est
+        # désactivée. Cela nettoie aussi les reliquats d'anciennes sources.
+        # On ne touche qu'aux docs ayant un champ `source` afin d'épargner
+        # les pharmacies ajoutées manuellement par un admin.
+        country_city_ids = await db.cities.distinct(
+            "_id", {"country_code": self.country_code}
+        )
+        sweep = await db.pharmacies.update_many(
+            {
+                "city_id":         {"$in": country_city_ids},
+                "source":          {"$exists": True},
+                "last_scraped_at": {"$ne": scraped_at},
+            },
+            {"$set": {"is_active": False, "is_on_duty_today": False}},
+        )
+        deactivated = sweep.modified_count
+        if deactivated:
+            log.info("[%s] %d pharmacie(s) obsolète(s) désactivée(s)",
+                     self.country_code, deactivated)
+
+        return {
+            "cities":      len(city_cache),
+            "upserted":    upserted,
+            "updated":     updated,
+            "deactivated": deactivated,
+        }
 
     # ── Cycle complet (fetch → parse → sync) ──────────────────────
     async def run(self, db: AsyncIOMotorDatabase) -> None:
@@ -153,6 +191,7 @@ class BaseScraper(ABC):
         log.info("[%s] %d pharmacies parsées, synchronisation…", self.country_code, len(pharmacies))
         stats = await self.sync(db, pharmacies)
         log.info(
-            "[%s] ✓ Sync OK — pays: 1 | villes: %d | créées: %d | mises à jour: %d",
+            "[%s] ✓ Sync OK — pays: 1 | villes: %d | créées: %d | mises à jour: %d | désactivées: %d",
             self.country_code, stats["cities"], stats["upserted"], stats["updated"],
+            stats.get("deactivated", 0),
         )

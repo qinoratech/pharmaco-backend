@@ -38,14 +38,14 @@ log = logging.getLogger("pharmaco.manager")
 # ══════════════════════════════════════════════════════════════════
 # SOURCES — importer chaque scraper ici (un import = un pays)
 # ══════════════════════════════════════════════════════════════════
-from app.worker.sources.bj_onpb          import OnpbBeninScraper
-from app.worker.sources.bj_pharmaco_web  import PharmacoWebBeninScraper
-# from app.worker.sources.bj_ubphar import UbpharBeninScraper  ← désactivé
-# from app.worker.sources.tg_monpharmacien import TogoScraper  ← exemple futur
+from app.worker.sources.bj_pharmaco_freeje import PharmacoFreejeBeninScraper
+# from app.worker.sources.bj_onpb          import OnpbBeninScraper          ← désactivé (OCR)
+# from app.worker.sources.bj_pharmaco_web  import PharmacoWebBeninScraper   ← désactivé
+# from app.worker.sources.bj_ubphar        import UbpharBeninScraper        ← désactivé
+# from app.worker.sources.tg_monpharmacien import TogoScraper               ← exemple futur
 
 SCRAPERS = [
-    PharmacoWebBeninScraper(),
-    OnpbBeninScraper(),
+    PharmacoFreejeBeninScraper(),
     # TogoScraper(),
 ]
 # ══════════════════════════════════════════════════════════════════
